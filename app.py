@@ -33,7 +33,7 @@ import json
 import traceback
 
 # ==================== CẤU HÌNH ====================
-TOKEN = '8505111864:AAGWXTB64emvtRoAwDm_zYrKZH88aDkLJks'
+TOKEN = '8505111864:AAGD5gs7qa4lb1wsvPYOwzl6JUTERo5MuuE'
 OWNER_ID = 8208489603
 YOUR_USERNAME = '@taolailove2'
 
