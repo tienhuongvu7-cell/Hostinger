@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import telebot
 from telebot import types
+from telebot.apihelper import ApiTelegramException
 import subprocess
 import os
 import zipfile
@@ -33,10 +34,15 @@ import json
 import traceback
 
 # ==================== CẤU HÌNH ====================
-TOKEN = '8505111864:AAGD5gs7qa4lb1wsvPYOwzl6JUTERo5MuuE'
-OWNER_ID = 8208489603
-YOUR_USERNAME = '@taolailove2'
+# ⚠️ Khuyến nghị: đặt token qua biến môi trường để tránh lộ token khi share code
+# Linux/Mac:  export BOT_TOKEN="123:ABC..."
+# Windows:    setx BOT_TOKEN "123:ABC..."
+TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TOKEN") or ""
+OWNER_ID = int(os.getenv("OWNER_ID", "8208489603"))
+YOUR_USERNAME = os.getenv("YOUR_USERNAME", "@taolailove2")
 
+if not TOKEN:
+    raise RuntimeError("❌ Thiếu BOT_TOKEN/TELEGRAM_BOT_TOKEN. Hãy set biến môi trường chứa token bot Telegram.")
 # Cấu hình thư mục
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 UPLOAD_BOTS_DIR = os.path.join(BASE_DIR, 'upload_bots')
@@ -105,15 +111,80 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==================== KHỞI TẠO BOT ====================
-bot = telebot.TeleBot(TOKEN)
-bot.set_my_commands([
-    telebot.types.BotCommand("start", "🚀 Khởi động bot"),
-    telebot.types.BotCommand("menu", "📋 Menu chính"),
-    telebot.types.BotCommand("daily", "🎁 Nhận coin hàng ngày"),
-    telebot.types.BotCommand("balance", "💰 Xem số dư"),
-    telebot.types.BotCommand("referral", "👥 Giới thiệu bạn bè"),
-    telebot.types.BotCommand("help", "🆘 Trợ giúp")
-])
+# ==================== KHỞI TẠO BOT ====================
+# Tăng số luồng để xử lý mượt hơn (phù hợp đa số host)
+try:
+    bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=int(os.getenv("BOT_THREADS", "8")))
+except TypeError:
+    # Fallback cho bản pyTelegramBotAPI cũ
+    bot = telebot.TeleBot(TOKEN)
+
+# ==================== SAFE TELEGRAM CALLS ====================
+# Tránh crash với các lỗi "không nghiêm trọng" (đặc biệt: message is not modified)
+def _should_ignore_telegram_exception(e: Exception) -> bool:
+    if not isinstance(e, ApiTelegramException):
+        return False
+
+    msg = str(e).lower()
+
+    # Telegram trả 400 khi edit y hệt nội dung/markup cũ
+    if "message is not modified" in msg:
+        return True
+
+    # Race condition / tin nhắn không còn hợp lệ để edit/delete
+    if "message to edit not found" in msg:
+        return True
+    if "message can't be edited" in msg:
+        return True
+    if "message to delete not found" in msg:
+        return True
+
+    # Callback quá hạn (người dùng bấm nút rất lâu sau)
+    if "query is too old" in msg or "response timeout expired" in msg:
+        return True
+
+    return False
+
+def _wrap_bot_method_safe(method_name: str):
+    original = getattr(bot, method_name, None)
+    if not original:
+        return
+
+    def wrapper(*args, **kwargs):
+        try:
+            return original(*args, **kwargs)
+        except ApiTelegramException as e:
+            if _should_ignore_telegram_exception(e):
+                return None
+            raise
+
+    setattr(bot, method_name, wrapper)
+
+for _name in ("edit_message_text", "edit_message_reply_markup", "delete_message", "answer_callback_query"):
+    _wrap_bot_method_safe(_name)
+
+# Cache bot username để tránh gọi get_me() quá nhiều (giảm lag/rate-limit)
+_BOT_USERNAME_CACHE = None
+
+def get_bot_username() -> str:
+    global _BOT_USERNAME_CACHE
+    if not _BOT_USERNAME_CACHE:
+        try:
+            _BOT_USERNAME_CACHE = bot.get_me().username
+        except Exception:
+            _BOT_USERNAME_CACHE = ""
+    return _BOT_USERNAME_CACHE or ""
+try:
+    bot.set_my_commands([
+        telebot.types.BotCommand("start", "🚀 Khởi động bot"),
+        telebot.types.BotCommand("menu", "📋 Menu chính"),
+        telebot.types.BotCommand("daily", "🎁 Nhận coin hàng ngày"),
+        telebot.types.BotCommand("balance", "💰 Xem số dư"),
+        telebot.types.BotCommand("referral", "👥 Giới thiệu bạn bè"),
+        telebot.types.BotCommand("help", "🆘 Trợ giúp")
+    ])
+except Exception as e:
+    logger.warning(f"⚠️ Không thể set_my_commands: {e}")
 
 # ==================== CẤU TRÚC DỮ LIỆU ====================
 @dataclass
@@ -888,7 +959,7 @@ class DatabaseManager:
             # Xóa file ảnh
             if image_path and os.path.exists(image_path):
                 try:
-                    os.remove(captcha['image_path'])
+                    os.remove(image_path)
                 except:
                     pass
     
@@ -2445,7 +2516,7 @@ def create_admin_panel_menu() -> types.InlineKeyboardMarkup:
 def create_referral_menu(user_id: int) -> types.InlineKeyboardMarkup:
     markup = types.InlineKeyboardMarkup(row_width=1)
     
-    bot_username = bot.get_me().username
+    bot_username = get_bot_username()
     ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
     
     markup.row(
@@ -2868,7 +2939,7 @@ def show_balance(message, user: UserData):
     )
 
 def show_referral_info(message, user: UserData):
-    bot_username = bot.get_me().username
+    bot_username = get_bot_username()
     ref_link = f"https://t.me/{bot_username}?start=ref_{user.user_id}"
     
     markup = create_referral_menu(user.user_id)
@@ -3210,7 +3281,7 @@ def handle_callbacks(call):
         # REFERRAL
         elif data == "referral":
             bot.answer_callback_query(call.id)
-            bot_username = bot.get_me().username
+            bot_username = get_bot_username()
             ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
             
             stats = db.get_referral_stats(user_id)
@@ -3231,7 +3302,7 @@ def handle_callbacks(call):
         # COPY REF LINK
         elif data.startswith("copy_ref_"):
             referrer_id = int(data.replace("copy_ref_", ""))
-            bot_username = bot.get_me().username
+            bot_username = get_bot_username()
             ref_link = f"https://t.me/{bot_username}?start=ref_{referrer_id}"
             
             bot.answer_callback_query(call.id, "✅ Đã copy link!", show_alert=True)
@@ -5310,9 +5381,89 @@ def handle_zip_file(downloaded_file, file_name, user_id, user_folder, message, s
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+# ==================== HEALTH CHECK SERVER ====================
+# Nhiều nền tảng host (Render/Koyeb/Railway/...) chạy "TCP/HTTP health check" vào 1 cổng (thường là 8000).
+# Bot Telegram chạy polling sẽ KHÔNG tự mở cổng => bị restart liên tục (log: TCP health check failed).
+_HEALTH_SERVER = None
+
+def start_health_server():
+    """Mở 1 HTTP server siêu nhẹ để pass health check của host."""
+    global _HEALTH_SERVER
+
+    # Ưu tiên PORT của host, fallback 8000 (đúng với log bạn gửi)
+    try:
+        port = int(os.getenv("PORT", "8000"))
+    except Exception:
+        port = 8000
+
+    host = "0.0.0.0"
+
+    try:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    except Exception:
+        # Fallback cho Python cũ
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from socketserver import ThreadingMixIn
+
+        class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+            daemon_threads = True
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(b"OK")
+            except Exception:
+                pass
+
+        def do_HEAD(self):
+            try:
+                self.send_response(200)
+                self.end_headers()
+            except Exception:
+                pass
+
+        def log_message(self, format, *args):
+            # tắt log request để đỡ spam
+            return
+
+    try:
+        _HEALTH_SERVER = ThreadingHTTPServer((host, port), Handler)
+    except OSError as e:
+        logger.warning(f"⚠️ Không thể mở health server tại {host}:{port}: {e}")
+        _HEALTH_SERVER = None
+        return None
+
+    t = threading.Thread(target=_HEALTH_SERVER.serve_forever, daemon=True)
+    t.start()
+    logger.info(f"🌐 Health server listening on {host}:{port}")
+    return _HEALTH_SERVER
+
+def stop_health_server():
+    global _HEALTH_SERVER
+    if _HEALTH_SERVER:
+        try:
+            _HEALTH_SERVER.shutdown()
+        except Exception:
+            pass
+        try:
+            _HEALTH_SERVER.server_close()
+        except Exception:
+            pass
+        _HEALTH_SERVER = None
+
+
 # ==================== CLEANUP ====================
 def cleanup():
     logger.info("🧹 Đang dọn dẹp...")
+
+    # Tắt health server (nếu có)
+    try:
+        stop_health_server()
+    except Exception:
+        pass
     
     # Dừng tất cả scripts
     running = script_manager.get_all_running()
@@ -5369,27 +5520,43 @@ if __name__ == '__main__':
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    # Chạy bot với retry
-    retry_count = 0
-    max_retries = 10
-    
-    while retry_count < max_retries:
+    # Start health server để pass TCP/HTTP health check của host
+# (Nếu host không cần, nó vẫn chạy nhẹ và không ảnh hưởng)
+start_health_server()
+
+# Chạy bot (auto-retry vô hạn + backoff) để hạn chế "crash"
+retry_count = 0
+backoff = 5  # seconds
+
+while True:
+    try:
+        logger.info("🚀 Bắt đầu polling...")
+
+        # Thử skip_pending nếu thư viện hỗ trợ (tránh xử lý backlog khi restart)
         try:
-            logger.info("🚀 Bắt đầu polling...")
+            bot.infinity_polling(timeout=60, long_polling_timeout=30, skip_pending=True)
+        except TypeError:
             bot.infinity_polling(timeout=60, long_polling_timeout=30)
-        except requests.exceptions.ReadTimeout:
-            logger.warning("⏰ Read timeout, khởi động lại polling...")
-            time.sleep(5)
-            retry_count += 1
-        except requests.exceptions.ConnectionError as e:
-            logger.error(f"🔌 Lỗi kết nối: {e}")
-            time.sleep(15)
-            retry_count += 1
-        except Exception as e:
-            logger.critical(f"💥 Lỗi nghiêm trọng: {e}", exc_info=True)
-            time.sleep(30)
-            retry_count += 1
-        
-        if retry_count >= max_retries:
-            logger.critical("❌ Quá số lần thử, thoát!")
-            break
+
+        # Nếu polling thoát ra (hiếm), reset backoff và chạy lại
+        retry_count = 0
+        backoff = 5
+        time.sleep(1)
+
+    except requests.exceptions.ReadTimeout:
+        retry_count += 1
+        logger.warning(f"⏰ Read timeout (lần {retry_count}), khởi động lại polling sau {backoff}s...")
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 60)
+
+    except requests.exceptions.ConnectionError as e:
+        retry_count += 1
+        logger.error(f"🔌 Lỗi kết nối (lần {retry_count}): {e}. Thử lại sau {backoff}s...")
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 60)
+
+    except Exception as e:
+        retry_count += 1
+        logger.critical(f"💥 Lỗi nghiêm trọng (lần {retry_count}): {e}", exc_info=True)
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 60)
