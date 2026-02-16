@@ -7,6 +7,7 @@ import zipfile
 import tempfile
 import shutil
 import time
+import gc
 from datetime import datetime, timedelta
 import psutil
 import sqlite3
@@ -26,6 +27,7 @@ from typing import Optional, Dict, List, Tuple, Set, Any, Union
 from dataclasses import dataclass, field
 from contextlib import contextmanager
 from queue import Queue
+from collections import deque, defaultdict
 from functools import wraps
 import json
 import traceback
@@ -64,6 +66,23 @@ MIN_TREASURE_COINS = 1
 MAX_TREASURE_COINS = 10
 TREASURE_COOLDOWN = 3600  # giây
 REFERRAL_COOLDOWN = 300  # 5 phút giữa các lần refer
+
+# Cấu hình Treo (Pin)
+PIN_COST_PER_DAY = 15  # coin / ngày
+MAX_PIN_DAYS = 7  # tối đa 7 ngày
+
+# Cấu hình Anti-Spam
+SPAM_MAX_ACTIONS = 12  # số hành động tối đa trong cửa sổ
+SPAM_WINDOW_SECONDS = 10
+SPAM_FILE_UPLOAD_LIMIT = 3  # số lần upload tối đa
+SPAM_FILE_UPLOAD_WINDOW = 60  # giây
+SPAM_PENALTY_MINUTES = 10  # ban tạm nếu spam nhiều lần
+
+# Cấu hình Antivirus/Anti-botnet (heuristic)
+MAX_ZIP_EXTRACT_MB = 100  # giới hạn tổng dung lượng giải nén để chống zip bomb
+MAX_ZIP_FILE_COUNT = 300  # giới hạn số file trong zip
+VIRUS_SCAN_MAX_BYTES = 2 * 1024 * 1024  # đọc tối đa 2MB mỗi file khi quét
+
 
 # Cấu hình Anti-Buff
 MAX_REFS_PER_IP = 3
@@ -260,6 +279,9 @@ class DatabaseManager:
                     last_started TIMESTAMP,
                     last_stopped TIMESTAMP,
                     run_count INTEGER DEFAULT 0,
+                    pinned_until TIMESTAMP,
+                    pinned_by INTEGER,
+                    pinned_at TIMESTAMP,
                     PRIMARY KEY (user_id, file_name)
                 )
             ''')
@@ -337,6 +359,7 @@ class DatabaseManager:
                 'CREATE INDEX IF NOT EXISTS idx_transactions_type ON transactions(type)',
                 'CREATE INDEX IF NOT EXISTS idx_transactions_created ON transactions(created_at)',
                 'CREATE INDEX IF NOT EXISTS idx_user_files_running ON user_files(is_running)',
+                'CREATE INDEX IF NOT EXISTS idx_user_files_pinned_until ON user_files(pinned_until)',
                 'CREATE INDEX IF NOT EXISTS idx_captcha_created ON captcha(created_at)',
                 'CREATE INDEX IF NOT EXISTS idx_anti_buff_blocked ON anti_buff(is_blocked)'
             ]
@@ -394,7 +417,10 @@ class DatabaseManager:
                 file_columns = [
                     ('file_size', 'INTEGER'),
                     ('last_stopped', 'TIMESTAMP'),
-                    ('run_count', 'INTEGER DEFAULT 0')
+                    ('run_count', 'INTEGER DEFAULT 0'),
+                    ('pinned_until', 'TIMESTAMP'),
+                    ('pinned_by', 'INTEGER'),
+                    ('pinned_at', 'TIMESTAMP')
                 ]
                 
                 for col_name, col_def in file_columns:
@@ -473,6 +499,13 @@ class DatabaseManager:
                             WHERE is_banned = 1 AND ban_until < datetime('now')
                         ''')
                         
+                        # Xóa treo hết hạn
+                        cursor.execute('''
+                            UPDATE user_files
+                            SET pinned_until = NULL, pinned_by = NULL, pinned_at = NULL
+                            WHERE pinned_until IS NOT NULL AND datetime(replace(pinned_until,'T',' ')) < datetime('now')
+                        ''')
+
                         conn.commit()
                 except Exception as e:
                     logger.error(f"Lỗi cleanup database: {e}")
@@ -837,11 +870,23 @@ class DatabaseManager:
     def delete_captcha(self, user_id: int):
         with self.get_connection() as conn:
             cursor = conn.cursor()
+            # Lấy thông tin trước khi xóa để còn xóa file ảnh
+            cursor.execute('SELECT image_path FROM captcha WHERE user_id = ?', (user_id,))
+            row = cursor.fetchone()
+            image_path = None
+            try:
+                if row:
+                    image_path = row['image_path']  # sqlite3.Row
+            except Exception:
+                try:
+                    image_path = row[0] if row else None
+                except Exception:
+                    image_path = None
+
             cursor.execute('DELETE FROM captcha WHERE user_id = ?', (user_id,))
-            
+
             # Xóa file ảnh
-            captcha = self.get_captcha(user_id)
-            if captcha and os.path.exists(captcha['image_path']):
+            if image_path and os.path.exists(image_path):
                 try:
                     os.remove(captcha['image_path'])
                 except:
@@ -949,6 +994,68 @@ class DatabaseManager:
                     WHERE user_id = ? AND file_name = ?
                 ''', (0, datetime.now().isoformat(), user_id, file_name))
     
+
+    # ==================== PIN/TREO METHODS ====================
+    def get_user_file(self, user_id: int, file_name: str) -> Optional[Dict]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT * FROM user_files
+                WHERE user_id = ? AND file_name = ?
+            ''', (user_id, file_name))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_file_pinned_until(self, user_id: int, file_name: str) -> Optional[datetime]:
+        info = self.get_user_file(user_id, file_name)
+        if not info:
+            return None
+        return self._parse_datetime(info.get('pinned_until'))
+
+    def set_file_pin(self, user_id: int, file_name: str, until: Optional[datetime], pinned_by: Optional[int] = None):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            if until:
+                cursor.execute('''
+                    UPDATE user_files
+                    SET pinned_until = ?, pinned_by = ?, pinned_at = ?
+                    WHERE user_id = ? AND file_name = ?
+                ''', (until.isoformat(), pinned_by, datetime.now().isoformat(), user_id, file_name))
+            else:
+                cursor.execute('''
+                    UPDATE user_files
+                    SET pinned_until = NULL, pinned_by = NULL, pinned_at = NULL
+                    WHERE user_id = ? AND file_name = ?
+                ''', (user_id, file_name))
+
+    def clear_file_pin(self, user_id: int, file_name: str):
+        self.set_file_pin(user_id, file_name, None, None)
+
+    def get_pinned_files(self, limit: int = 20, page: int = 1) -> Tuple[List[Dict], int]:
+        """Danh sách file đang treo (pinned) để admin quản lý."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            now = datetime.now().isoformat()
+
+            cursor.execute('''
+                SELECT COUNT(*) as total
+                FROM user_files
+                WHERE pinned_until IS NOT NULL AND pinned_until > ?
+            ''', (now,))
+            total = cursor.fetchone()['total']
+
+            offset = (page - 1) * limit
+            cursor.execute('''
+                SELECT uf.*, u.username, u.first_name
+                FROM user_files uf
+                LEFT JOIN users u ON uf.user_id = u.user_id
+                WHERE uf.pinned_until IS NOT NULL AND uf.pinned_until > ?
+                ORDER BY uf.pinned_until DESC
+                LIMIT ? OFFSET ?
+            ''', (now, limit, offset))
+
+            return [dict(row) for row in cursor.fetchall()], total
+
     # ==================== ACTIVE USERS ====================
     def add_active_user(self, user_id: int):
         with self.get_connection() as conn:
@@ -1208,22 +1315,172 @@ class BotScriptManager:
     def __init__(self):
         self.running_scripts: Dict[str, Dict] = {}
         self.lock = threading.RLock()
+        # lưu lịch sử auto-restart để chống loop crash
+        self.restart_history: Dict[str, deque] = defaultdict(deque)
         self.monitor_thread = threading.Thread(target=self._monitor_scripts, daemon=True)
         self.monitor_thread.start()
-    
+
+    def _restart_allowed(self, script_key: str, max_restarts: int = 5, window_seconds: int = 600) -> bool:
+        """Giới hạn auto-restart để tránh loop crash."""
+        now = time.time()
+        dq = self.restart_history[script_key]
+        while dq and now - dq[0] > window_seconds:
+            dq.popleft()
+        if len(dq) >= max_restarts:
+            return False
+        dq.append(now)
+        return True
+
+    def _spawn_script_process(self, script_path: str, user_id: int, folder: str, file_name: str, script_type: str, reason: str = "") -> bool:
+        """Spawn process (không gửi reply). Dùng cho auto-restart."""
+        try:
+            if not os.path.exists(script_path):
+                return False
+
+            if self.is_running(user_id, file_name):
+                return False
+
+            # Tạo file log
+            log_path = os.path.join(folder, f"{os.path.splitext(file_name)[0]}.log")
+            log_file = open(log_path, 'a', encoding='utf-8', errors='ignore')
+            tag = "AUTO-RESTART" if reason else "BẮT ĐẦU"
+            log_file.write(f"\n--- {tag} {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {reason} ---\n")
+            log_file.flush()
+
+            # Chạy script
+            startupinfo = None
+            creationflags = 0
+            if os.name == 'nt':
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                creationflags = subprocess.CREATE_NO_WINDOW
+
+            cmd = [sys.executable, script_path] if script_type == 'py' else ['node', script_path]
+            process = subprocess.Popen(
+                cmd,
+                cwd=folder,
+                stdout=log_file,
+                stderr=log_file,
+                stdin=subprocess.PIPE,
+                startupinfo=startupinfo,
+                encoding='utf-8',
+                errors='ignore',
+                creationflags=creationflags
+            )
+
+            script_key = f"{user_id}_{file_name}"
+            with self.lock:
+                self.running_scripts[script_key] = {
+                    'process': process,
+                    'log_file': log_file,
+                    'file_name': file_name,
+                    'user_id': user_id,
+                    'start_time': datetime.now(),
+                    'folder': folder,
+                    'type': script_type,
+                    'pid': process.pid
+                }
+
+            db.update_file_status(user_id, file_name, True, process.pid)
+            return True
+        except Exception as e:
+            logger.error(f"Lỗi spawn process {user_id}_{file_name}: {e}")
+            return False
+
+    def _maybe_auto_restart(self, script_key: str, last_info: Dict):
+        """Nếu file đang TREO còn hạn -> tự restart khi crash."""
+        try:
+            user_id = last_info.get('user_id')
+            file_name = last_info.get('file_name')
+            folder = last_info.get('folder') or os.path.join(UPLOAD_BOTS_DIR, str(user_id))
+            script_type = last_info.get('type') or ('py' if str(file_name).endswith('.py') else 'js')
+
+            if not user_id or not file_name:
+                return
+
+            # kiểm tra treo còn hạn
+            pin_until = db.get_file_pinned_until(user_id, file_name)
+            if not pin_until or pin_until <= datetime.now():
+                return
+
+            script_path = os.path.join(folder, file_name)
+            if not os.path.exists(script_path):
+                # file mất -> hủy treo
+                try:
+                    db.clear_file_pin(user_id, file_name)
+                except Exception:
+                    pass
+                return
+
+            if not self._restart_allowed(script_key):
+                try:
+                    bot.send_message(
+                        user_id,
+                        f"⚠️ Script `{file_name}` đang TREO bị crash liên tục. Hệ thống tạm dừng auto-restart.\n👉 Vui lòng xem Logs và chạy lại thủ công.",
+                        parse_mode='Markdown'
+                    )
+                except Exception:
+                    pass
+                return
+
+            ok = self._spawn_script_process(script_path, user_id, folder, file_name, script_type, reason="(TREO)")
+            if ok:
+                try:
+                    bot.send_message(
+                        user_id,
+                        f"♻️ Auto-restart: Script `{file_name}` đã được chạy lại (do đang TREO).",
+                        parse_mode='Markdown'
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.error(f"Lỗi auto restart {script_key}: {e}")
+
     def _monitor_scripts(self):
         while True:
             time.sleep(10)
+            ended: List[Tuple[str, Dict]] = []
+
             with self.lock:
                 for script_key, script_info in list(self.running_scripts.items()):
                     try:
-                        if 'process' in script_info:
-                            process = psutil.Process(script_info['process'].pid)
-                            if not process.is_running() or process.status() == psutil.STATUS_ZOMBIE:
-                                self._cleanup_script(script_key)
+                        proc = script_info.get('process')
+                        if not proc:
+                            ended.append((script_key, script_info))
+                            continue
+
+                        # proc.poll() != None nghĩa là đã kết thúc
+                        if proc.poll() is not None:
+                            ended.append((script_key, script_info))
+                            continue
+
+                        p = psutil.Process(proc.pid)
+                        if (not p.is_running()) or p.status() == psutil.STATUS_ZOMBIE:
+                            ended.append((script_key, script_info))
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        self._cleanup_script(script_key)
-    
+                        ended.append((script_key, script_info))
+                    except Exception:
+                        ended.append((script_key, script_info))
+
+                # Cleanup trong lock (đóng log + remove dict)
+                for k, info in ended:
+                    try:
+                        try:
+                            self._kill_process_tree(info)
+                        except Exception:
+                            pass
+                        self._cleanup_script(k)
+                    except Exception:
+                        pass
+
+            # cập nhật DB + auto-restart ngoài lock
+            for k, info in ended:
+                try:
+                    db.update_file_status(info.get('user_id'), info.get('file_name'), False)
+                except Exception:
+                    pass
+                self._maybe_auto_restart(k, info)
+
     def is_running(self, user_id: int, file_name: str) -> bool:
         script_key = f"{user_id}_{file_name}"
         with self.lock:
@@ -1657,11 +1914,227 @@ class BotScriptManager:
 # ==================== KHỞI TẠO SCRIPT MANAGER ====================
 script_manager = BotScriptManager()
 
+# ==================== ANTI-SPAM & FILE SECURITY ====================
+class SpamProtector:
+    """Chống spam cơ bản (in-memory).
+
+    - Giới hạn callback spam và upload spam.
+    - Tăng mức phạt nếu vi phạm liên tục.
+    """
+    def __init__(self):
+        self._actions = defaultdict(deque)  # (user_id, key) -> deque[timestamps]
+        self._violations = defaultdict(int)  # user_id -> count
+        self._lock = threading.RLock()
+
+    def check(self, user_id: int, key: str, limit: int, window_seconds: int, ban_minutes: int = SPAM_PENALTY_MINUTES) -> Tuple[bool, str]:
+        now = time.time()
+        k = (user_id, key)
+
+        with self._lock:
+            dq = self._actions[k]
+            # clear old
+            while dq and now - dq[0] > window_seconds:
+                dq.popleft()
+
+            if len(dq) >= limit:
+                self._violations[user_id] += 1
+                vio = self._violations[user_id]
+
+                # Phạt tăng dần
+                if vio >= 3:
+                    try:
+                        db.ban_user(user_id, ban_minutes, f"Auto-ban spam ({key})")
+                    except Exception:
+                        pass
+                    return False, f"🚫 Spam quá nhanh! Bạn bị ban tạm {ban_minutes} phút."
+
+                wait = max(1, window_seconds - int(now - dq[0])) if dq else window_seconds
+                return False, f"⚠️ Bạn thao tác quá nhanh! Đợi {wait}s rồi thử lại."
+
+            dq.append(now)
+            return True, ""
+
+
+class FileSecurityScanner:
+    """Quét heuristic để chặn file có dấu hiệu botnet/virus.
+
+    Lưu ý: Đây là lớp phòng thủ cơ bản, tránh tải/host các file có hành vi nguy hiểm rõ ràng.
+    """
+
+    # Các đuôi file nguy hiểm/không cần thiết cho hệ thống host .py/.js
+    BLOCK_EXTS = {
+        '.exe', '.dll', '.so', '.dylib', '.bin', '.elf', '.apk', '.ipa',
+        '.bat', '.cmd', '.ps1', '.vbs', '.scr', '.jar', '.com', '.msi'
+    }
+
+    # Pattern nguy hiểm (ưu tiên chặn những hành vi download & execute, miner, ddos)
+    HIGH_RISK_PATTERNS = [
+        # download & execute
+        r"\b(curl|wget)\b[^\n]{0,200}\b(sh|bash)\b",
+        r"\b(curl|wget)\b[^\n]{0,200}\|\s*(sh|bash)\b",
+        r"\bchmod\s*\+x\b[^\n]{0,120}\b(\./|/tmp/)\S+",
+        r"\b(/tmp/|/var/tmp/)\S+\b",
+
+        # reverse shell common
+        r"\b(nc|netcat)\b[^\n]{0,120}\s-\s*e\b",
+        r"\b/bash\s+-i\b",
+        r"\b0\.0\.0\.0\b\s*:\s*\d{2,5}",
+
+        # miner keywords
+        r"\b(xmrig|minerd|stratum\+tcp|cryptonight|monero)\b",
+
+        # ddos keywords
+        r"\b(udp\s*flood|syn\s*flood|http\s*flood|ddos)\b",
+
+        # destructive commands
+        r"\brm\s+-rf\s+/\b",
+        r"\bmkfs\.",
+        r"\bdd\s+if=",
+    ]
+
+    MEDIUM_RISK_PATTERNS = [
+        r"\bchild_process\.(exec|spawn)\b",
+        r"\bos\.system\b",
+        r"\bsubprocess\.(Popen|call|run)\b",
+        r"\beval\s*\(",
+        r"\bexec\s*\(",
+        r"\bbase64\.b64decode\b",
+        r"\bFunction\s*\(",
+    ]
+
+    BASE64_LONG_RE = re.compile(r"[A-Za-z0-9+/]{800,}={0,2}")
+
+    def __init__(self):
+        self._high = [re.compile(p, re.IGNORECASE) for p in self.HIGH_RISK_PATTERNS]
+        self._medium = [re.compile(p, re.IGNORECASE) for p in self.MEDIUM_RISK_PATTERNS]
+
+    def _is_binary(self, data: bytes) -> bool:
+        # Null byte thường là binary
+        if b'\x00' in data:
+            return True
+        # Heuristic: tỷ lệ ký tự không in được
+        sample = data[:4096]
+        if not sample:
+            return False
+        nontext = sum(1 for b in sample if b < 9 or (b > 13 and b < 32))
+        return (nontext / len(sample)) > 0.30
+
+    def scan_bytes(self, file_name: str, data: bytes) -> Tuple[bool, str]:
+        ext = os.path.splitext(file_name)[1].lower()
+
+        if ext in self.BLOCK_EXTS:
+            return False, f"🚫 File bị chặn do định dạng nguy hiểm: {ext}"
+
+        # Chỉ quét nội dung text cơ bản
+        if ext in {'.py', '.js', '.txt', '.md', '.json', '.yml', '.yaml', '.ini', '.cfg', '.env'}:
+            if self._is_binary(data):
+                return False, "🚫 File có dấu hiệu binary/đính kèm mã độc."
+
+            try:
+                content = data[:VIRUS_SCAN_MAX_BYTES].decode('utf-8', errors='ignore')
+            except Exception:
+                content = str(data[:VIRUS_SCAN_MAX_BYTES])
+
+            # Base64 dài bất thường
+            if self.BASE64_LONG_RE.search(content):
+                # không chắc độc, nhưng thường dùng để che payload
+                return False, "🚫 Phát hiện chuỗi Base64 rất dài (nguy cơ payload ẩn)."
+
+            for rgx in self._high:
+                if rgx.search(content):
+                    return False, "🚫 Phát hiện mẫu hành vi nguy hiểm (botnet/virus/miner)."
+
+            # Medium risk: chỉ cảnh báo nếu nhiều pattern
+            medium_hits = sum(1 for rgx in self._medium if rgx.search(content))
+            if medium_hits >= 3:
+                return False, "🚫 Script chứa nhiều hành vi nguy hiểm (exec/subprocess/eval...)."
+
+            return True, ""
+
+        # File khác (ảnh, font...) cho phép, nhưng không chạy
+        return True, ""
+
+    def scan_zip_safely(self, zip_path: str) -> Tuple[bool, str]:
+        """Quét zip: chống zip bomb + chặn file nguy hiểm + quét sơ nội dung file text."""
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                infos = zf.infolist()
+                if len(infos) > MAX_ZIP_FILE_COUNT:
+                    return False, f"🚫 Zip quá nhiều file ({len(infos)}), nghi zip-bomb."
+
+                total_size = sum(i.file_size for i in infos)
+                if total_size > MAX_ZIP_EXTRACT_MB * 1024 * 1024:
+                    return False, f"🚫 Zip giải nén vượt {MAX_ZIP_EXTRACT_MB}MB (nghi zip-bomb)."
+
+                for i in infos:
+                    name = i.filename
+                    ext = os.path.splitext(name)[1].lower()
+                    if ext in self.BLOCK_EXTS:
+                        return False, f"🚫 Zip chứa file nguy hiểm: {name}"
+
+                    # Quét nhanh file text nhỏ
+                    if ext in {'.py', '.js', '.txt', '.md', '.json', '.yml', '.yaml', '.ini', '.cfg', '.env'} and i.file_size <= VIRUS_SCAN_MAX_BYTES:
+                        try:
+                            with zf.open(i, 'r') as fp:
+                                data = fp.read(VIRUS_SCAN_MAX_BYTES)
+                            ok, msg = self.scan_bytes(name, data)
+                            if not ok:
+                                return False, msg + f" (trong zip: {name})"
+                        except Exception:
+                            # Nếu không đọc được thì bỏ qua quét nội dung, vẫn an toàn vì đã chặn ext nguy hiểm
+                            pass
+
+            return True, ""
+        except zipfile.BadZipFile:
+            return False, "🚫 Zip lỗi/không hợp lệ."
+        except Exception as e:
+            return False, f"🚫 Không quét được zip: {e}"
+
+
+spam_protector = SpamProtector()
+file_scanner = FileSecurityScanner()
+
 # ==================== HÀM TIỆN ÍCH ====================
 def get_user_folder(user_id: int) -> str:
     folder = os.path.join(UPLOAD_BOTS_DIR, str(user_id))
     os.makedirs(folder, exist_ok=True)
     return folder
+
+def sanitize_filename(file_name: str) -> str:
+    """Chống path traversal, chuẩn hóa tên file."""
+    if not file_name:
+        return ""
+    # bỏ đường dẫn nếu có
+    file_name = os.path.basename(file_name)
+    # thay ký tự nguy hiểm
+    file_name = file_name.replace('\x00', '')
+    file_name = file_name.replace('/', '_').replace('\\', '_')
+    # giới hạn độ dài để tránh callback_data quá dài / FS issues
+    if len(file_name) > 120:
+        base, ext = os.path.splitext(file_name)
+        file_name = base[:100] + ext
+    return file_name
+
+def parse_iso_datetime(val) -> Optional[datetime]:
+    try:
+        if not val:
+            return None
+        return datetime.fromisoformat(val)
+    except Exception:
+        return None
+
+def is_pin_active(pin_until: Optional[datetime]) -> bool:
+    return bool(pin_until and pin_until > datetime.now())
+
+def pin_remaining_days(pin_until: Optional[datetime]) -> int:
+    if not pin_until:
+        return 0
+    diff = pin_until - datetime.now()
+    if diff.total_seconds() <= 0:
+        return 0
+    # làm tròn lên theo ngày
+    return int((diff.total_seconds() + 86399) // 86400)
+
 
 def get_user_file_limit(user_id: int) -> float:
     user = db.get_user(user_id)
@@ -1852,13 +2325,40 @@ def create_files_menu(user_id: int) -> types.InlineKeyboardMarkup:
             is_running = script_manager.is_running(user_id, file_name)
             
             status_emoji = "🟢" if is_running else "🔴"
+
+            
             run_count = file.get('run_count', 0)
+
+
+            
+            pin_until = parse_iso_datetime(file.get('pinned_until'))
+
+            
+            pin_tag = ""
+
+            
+            if is_pin_active(pin_until):
+
+            
+                pin_tag = f" 📌{pin_remaining_days(pin_until)}d"
+
+
             
             markup.row(
+
+            
                 types.InlineKeyboardButton(
-                    f"{status_emoji} {file_name} ({file_type}) | {run_count} lần chạy",
+
+            
+                    f"{status_emoji} {file_name} ({file_type}) | {run_count} lần chạy{pin_tag}",
+
+            
                     callback_data=f"file_{user_id}_{file_name}"
+
+            
                 )
+
+            
             )
     
     markup.row(
@@ -1888,6 +2388,20 @@ def create_file_control_menu(user_id: int, file_name: str) -> types.InlineKeyboa
         types.InlineKeyboardButton("📥 Download", callback_data=f"download_{user_id}_{file_name}")
     )
     
+    # Treo (pin) file: 15 coin/ngày, tối đa 7 ngày
+    pin_until = db.get_file_pinned_until(user_id, file_name)
+    if is_pin_active(pin_until):
+        days_left = pin_remaining_days(pin_until)
+        markup.row(
+            types.InlineKeyboardButton(f"📌 Đang treo: {days_left}d", callback_data=f"pininfo_{user_id}_{file_name}"),
+            types.InlineKeyboardButton("❌ Hủy treo", callback_data=f"unpin_{user_id}_{file_name}")
+        )
+    else:
+        markup.row(
+            types.InlineKeyboardButton("📌 Treo (15 coin/ngày)", callback_data=f"pin_{user_id}_{file_name}")
+        )
+
+    
     markup.row(
         types.InlineKeyboardButton("🔙 Quay Lại", callback_data="my_files")
     )
@@ -1913,6 +2427,10 @@ def create_admin_panel_menu() -> types.InlineKeyboardMarkup:
         [
             types.InlineKeyboardButton("🔍 Check IP", callback_data="admin_check_ip"),
             types.InlineKeyboardButton("📈 Scripts", callback_data="admin_scripts")
+        ],
+        [
+            types.InlineKeyboardButton("📌 Treo", callback_data="admin_pins"),
+            types.InlineKeyboardButton("🧹 Clear RAM", callback_data="admin_clear_ram")
         ],
         [
             types.InlineKeyboardButton("🔙 Quay Lại", callback_data="main_menu")
@@ -2627,7 +3145,13 @@ def handle_callbacks(call):
             call.from_user.first_name or ""
         )
         
-        # MAIN MENU
+        # Anti-spam callback
+        ok_spam, spam_msg = spam_protector.check(user_id, "callback", SPAM_MAX_ACTIONS, SPAM_WINDOW_SECONDS)
+        if not ok_spam:
+            bot.answer_callback_query(call.id, spam_msg, show_alert=True)
+            return
+
+# MAIN MENU
         if data == "main_menu":
             bot.edit_message_text(
                 f"👋 **CHÀO MỪNG TRỞ LẠI!**\n\n"
@@ -3026,7 +3550,12 @@ def handle_callbacks(call):
             
             file_info = next((f for f in db.get_user_files(file_user_id) if f['file_name'] == file_name), {})
             run_count = file_info.get('run_count', 0)
-            
+
+            pin_until = db.get_file_pinned_until(file_user_id, file_name)
+            pin_line = ""
+            if is_pin_active(pin_until):
+                pin_line = f"📌 **Treo tới:** {pin_until.strftime('%H:%M %d/%m/%Y')} (còn {pin_remaining_days(pin_until)} ngày)\n"
+
             markup = create_file_control_menu(file_user_id, file_name)
             
             bot.edit_message_text(
@@ -3034,6 +3563,7 @@ def handle_callbacks(call):
                 f"📄 **File:** `{file_name}`\n"
                 f"👤 **User:** `{file_user_id}`\n"
                 f"📊 **Trạng thái:** {status}\n"
+                f"{pin_line}"
                 f"🔄 **Đã chạy:** `{run_count}` lần\n\n"
                 f"Chọn thao tác:",
                 chat_id=call.message.chat.id,
@@ -3044,6 +3574,225 @@ def handle_callbacks(call):
             
             bot.answer_callback_query(call.id)
         
+
+        # PIN/TREO - CHỌN SỐ NGÀY
+        elif data.startswith("pin_"):
+            _, script_user_id, file_name = data.split('_', 2)
+            script_user_id = int(script_user_id)
+
+            if user_id != script_user_id and not db.is_admin(user_id):
+                bot.answer_callback_query(call.id, "⛔ Bạn không có quyền!", show_alert=True)
+                return
+
+            # kiểm tra file tồn tại
+            folder = get_user_folder(script_user_id)
+            file_path = os.path.join(folder, file_name)
+            if not os.path.exists(file_path):
+                bot.answer_callback_query(call.id, "❌ File không tồn tại!", show_alert=True)
+                try:
+                    db.remove_user_file(script_user_id, file_name)
+                except Exception:
+                    pass
+                return
+
+            pin_until = db.get_file_pinned_until(script_user_id, file_name)
+            remaining = pin_remaining_days(pin_until) if is_pin_active(pin_until) else 0
+            allowed_add = max(0, MAX_PIN_DAYS - remaining)
+
+            if allowed_add <= 0:
+                bot.answer_callback_query(call.id, f"⚠️ File đã treo tối đa {MAX_PIN_DAYS} ngày.", show_alert=True)
+                return
+
+            markup = types.InlineKeyboardMarkup(row_width=2)
+            # tạo nút chọn ngày (tối đa allowed_add)
+            for d in range(1, allowed_add + 1):
+                cost = d * PIN_COST_PER_DAY
+                markup.insert(
+                    types.InlineKeyboardButton(
+                        f"{d} ngày - {cost} coin",
+                        callback_data=f"pinbuy_{script_user_id}_{d}_{file_name}"
+                    )
+                )
+
+            markup.row(
+                types.InlineKeyboardButton("🔙 Quay Lại", callback_data=f"file_{script_user_id}_{file_name}")
+            )
+
+            info_txt = (
+                f"📌 **TREO FILE**\n\n"
+                f"📄 **File:** `{file_name}`\n"
+                f"💸 **Giá:** `{PIN_COST_PER_DAY}` coin/ngày\n"
+                f"⏳ **Tối đa:** `{MAX_PIN_DAYS}` ngày\n"
+            )
+            if remaining > 0:
+                info_txt += f"📌 **Đang treo:** còn `{remaining}` ngày\n"
+                info_txt += f"👉 Có thể gia hạn thêm tối đa `{allowed_add}` ngày\n"
+            info_txt += "\nChọn số ngày treo:"
+
+            bot.edit_message_text(
+                info_txt,
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                parse_mode='Markdown',
+                reply_markup=markup
+            )
+            bot.answer_callback_query(call.id)
+
+        # PIN/TREO - MUA
+        elif data.startswith("pinbuy_"):
+            try:
+                _, script_user_id, days_str, file_name = data.split('_', 3)
+                script_user_id = int(script_user_id)
+                days = int(days_str)
+            except Exception:
+                bot.answer_callback_query(call.id, "❌ Dữ liệu không hợp lệ!", show_alert=True)
+                return
+
+            if days < 1 or days > MAX_PIN_DAYS:
+                bot.answer_callback_query(call.id, f"❌ Chỉ được treo 1-{MAX_PIN_DAYS} ngày!", show_alert=True)
+                return
+
+            if user_id != script_user_id and not db.is_admin(user_id):
+                bot.answer_callback_query(call.id, "⛔ Bạn không có quyền!", show_alert=True)
+                return
+
+            # kiểm tra file tồn tại
+            folder = get_user_folder(script_user_id)
+            file_path = os.path.join(folder, file_name)
+            if not os.path.exists(file_path):
+                bot.answer_callback_query(call.id, "❌ File không tồn tại!", show_alert=True)
+                try:
+                    db.remove_user_file(script_user_id, file_name)
+                except Exception:
+                    pass
+                return
+
+            pin_until = db.get_file_pinned_until(script_user_id, file_name)
+            remaining = pin_remaining_days(pin_until) if is_pin_active(pin_until) else 0
+            allowed_add = max(0, MAX_PIN_DAYS - remaining)
+            if days > allowed_add:
+                bot.answer_callback_query(
+                    call.id,
+                    f"⚠️ Tối đa {MAX_PIN_DAYS} ngày treo. Hiện còn {remaining}d, chỉ gia hạn thêm tối đa {allowed_add}d.",
+                    show_alert=True
+                )
+                return
+
+            cost = days * PIN_COST_PER_DAY
+            target_user = db.get_user(script_user_id)
+            if not target_user:
+                bot.answer_callback_query(call.id, "❌ User không tồn tại!", show_alert=True)
+                return
+
+            if target_user.balance < cost:
+                bot.answer_callback_query(
+                    call.id,
+                    f"❌ Không đủ coin! Cần {cost} coin, bạn có {target_user.balance} coin.",
+                    show_alert=True
+                )
+                return
+
+            # trừ coin
+            target_user.balance -= cost
+            db.update_user(target_user)
+            try:
+                db.add_transaction(
+                    script_user_id,
+                    -cost,
+                    'pin',
+                    f'Treo file {file_name} {days} ngày',
+                    target_user.balance
+                )
+            except Exception:
+                pass
+
+            now = datetime.now()
+            base = pin_until if (pin_until and pin_until > now) else now
+            new_until = base + timedelta(days=days)
+
+            # lưu pin
+            db.set_file_pin(script_user_id, file_name, new_until, pinned_by=user_id)
+
+            bot.answer_callback_query(call.id, "✅ Đã treo file!")
+
+            # Auto-start nếu chưa chạy
+            if not script_manager.is_running(script_user_id, file_name):
+                file_type = 'py' if file_name.endswith('.py') else 'js'
+                if file_type == 'py':
+                    script_manager.run_python_script(file_path, script_user_id, folder, file_name, call.message)
+                else:
+                    script_manager.run_js_script(file_path, script_user_id, folder, file_name, call.message)
+
+            markup = create_file_control_menu(script_user_id, file_name)
+            bot.edit_message_text(
+                f"✅ **TREO THÀNH CÔNG!**\n\n"
+                f"📄 **File:** `{file_name}`\n"
+                f"⏳ **Treo tới:** `{new_until.strftime('%H:%M %d/%m/%Y')}`\n"
+                f"💸 **Đã trừ:** `-{cost}` coin\n"
+                f"💰 **Số dư:** `{format_number(target_user.balance)}` coin\n\n"
+                f"⚙️ Hệ thống sẽ **auto-restart** nếu script crash trong thời gian treo.",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                parse_mode='Markdown',
+                reply_markup=markup
+            )
+
+        # PIN/TREO - THÔNG TIN
+        elif data.startswith("pininfo_"):
+            _, script_user_id, file_name = data.split('_', 2)
+            script_user_id = int(script_user_id)
+
+            if user_id != script_user_id and not db.is_admin(user_id):
+                bot.answer_callback_query(call.id, "⛔ Bạn không có quyền!", show_alert=True)
+                return
+
+            pin_until = db.get_file_pinned_until(script_user_id, file_name)
+            if not is_pin_active(pin_until):
+                bot.answer_callback_query(call.id, "ℹ️ File hiện không treo.", show_alert=True)
+                return
+
+            days_left = pin_remaining_days(pin_until)
+            markup = types.InlineKeyboardMarkup(row_width=2)
+            markup.row(
+                types.InlineKeyboardButton("➕ Gia hạn", callback_data=f"pin_{script_user_id}_{file_name}"),
+                types.InlineKeyboardButton("❌ Hủy treo", callback_data=f"unpin_{script_user_id}_{file_name}")
+            )
+            markup.row(
+                types.InlineKeyboardButton("🔙 Quay Lại", callback_data=f"file_{script_user_id}_{file_name}")
+            )
+
+            bot.edit_message_text(
+                f"📌 **THÔNG TIN TREO**\n\n"
+                f"📄 **File:** `{file_name}`\n"
+                f"⏳ **Treo tới:** `{pin_until.strftime('%H:%M %d/%m/%Y')}`\n"
+                f"🕒 **Còn:** `{days_left}` ngày\n\n"
+                f"Trong thời gian treo, hệ thống sẽ auto-restart nếu script crash.",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                parse_mode='Markdown',
+                reply_markup=markup
+            )
+            bot.answer_callback_query(call.id)
+
+        # PIN/TREO - HỦY
+        elif data.startswith("unpin_"):
+            _, script_user_id, file_name = data.split('_', 2)
+            script_user_id = int(script_user_id)
+
+            if user_id != script_user_id and not db.is_admin(user_id):
+                bot.answer_callback_query(call.id, "⛔ Bạn không có quyền!", show_alert=True)
+                return
+
+            db.clear_file_pin(script_user_id, file_name)
+
+            bot.answer_callback_query(call.id, "✅ Đã hủy treo!")
+            markup = create_file_control_menu(script_user_id, file_name)
+            bot.edit_message_reply_markup(
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=markup
+            )
+
         # START SCRIPT
         elif data.startswith("start_"):
             _, script_user_id, file_name = data.split('_', 2)
@@ -3276,6 +4025,129 @@ def handle_callbacks(call):
                 reply_markup=create_admin_panel_menu()
             )
         
+
+        # ADMIN - CLEAR RAM
+        elif data == "admin_clear_ram":
+            if not db.is_admin(user_id):
+                bot.answer_callback_query(call.id, "⛔ Bạn không phải admin!", show_alert=True)
+                return
+
+            bot.answer_callback_query(call.id, "🧹 Đang dọn RAM...")
+            proc = psutil.Process(os.getpid())
+            before = proc.memory_info().rss
+
+            # dọn rác python
+            try:
+                gc.collect()
+            except Exception:
+                pass
+
+            # cố gắng trả heap về OS (Linux)
+            trimmed = False
+            try:
+                import ctypes
+                libc = ctypes.CDLL("libc.so.6")
+                if hasattr(libc, "malloc_trim"):
+                    libc.malloc_trim(0)
+                    trimmed = True
+            except Exception:
+                trimmed = False
+
+            # dọn temp file cũ
+            removed = 0
+            try:
+                now_ts = time.time()
+                for fn in os.listdir(TEMP_DIR):
+                    fp = os.path.join(TEMP_DIR, fn)
+                    try:
+                        if os.path.isfile(fp):
+                            if now_ts - os.path.getmtime(fp) > 24 * 3600:
+                                os.remove(fp)
+                                removed += 1
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            after = proc.memory_info().rss
+            diff = before - after
+
+            bot.edit_message_text(
+                f"🧹 **CLEAR RAM**\n\n"
+                f"📌 **RSS trước:** `{before/1024/1024:.2f} MB`\n"
+                f"📌 **RSS sau:** `{after/1024/1024:.2f} MB`\n"
+                f"📉 **Giảm:** `{diff/1024/1024:.2f} MB`\n"
+                f"🧠 **malloc_trim:** `{trimmed}`\n"
+                f"🗑️ **Xóa temp cũ:** `{removed}` file\n",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                parse_mode='Markdown',
+                reply_markup=create_admin_panel_menu()
+            )
+
+        # ADMIN - PIN/TREO MANAGER
+        elif data == "admin_pins" or data.startswith("admin_pins_page_"):
+            if not db.is_admin(user_id):
+                bot.answer_callback_query(call.id, "⛔ Bạn không phải admin!", show_alert=True)
+                return
+
+            if data.startswith("admin_pins_page_"):
+                try:
+                    page = int(data.split('_')[-1])
+                except Exception:
+                    page = 1
+            else:
+                page = 1
+
+            limit = 5
+            pins, total = db.get_pinned_files(limit, page)
+            max_page = max(1, (total + limit - 1) // limit)
+
+            text_p = f"📌 **DANH SÁCH FILE ĐANG TREO**\n\n"
+            text_p += f"📄 Tổng: `{total}` | Trang: `{page}/{max_page}`\n\n"
+
+            if not pins:
+                text_p += "📭 Không có file nào đang treo."
+            else:
+                for i, p in enumerate(pins, 1):
+                    until = parse_iso_datetime(p.get('pinned_until'))
+                    days_left = pin_remaining_days(until) if is_pin_active(until) else 0
+                    name = p.get('first_name') or p.get('username') or ''
+                    who = f"{name}" if name else str(p.get('user_id'))
+                    text_p += (
+                        f"{i}. 👤 `{p.get('user_id')}` ({who})\n"
+                        f"   📄 `{p.get('file_name')}`\n"
+                        f"   ⏳ Tới: `{until.strftime('%H:%M %d/%m/%Y') if until else 'N/A'}` (còn `{days_left}`d)\n\n"
+                    )
+
+            markup = types.InlineKeyboardMarkup(row_width=3)
+
+            # nút hủy theo index
+            if pins:
+                for i, p in enumerate(pins, 1):
+                    markup.add(types.InlineKeyboardButton(f"❌ Hủy #{i}", callback_data=f"unpin_{p.get('user_id')}_{p.get('file_name')}"))
+
+            # phân trang
+            prev_cb = f"admin_pins_page_{page-1}" if page > 1 else "noop"
+            next_cb = f"admin_pins_page_{page+1}" if page < max_page else "noop"
+            markup.row(
+                types.InlineKeyboardButton("⏮️", callback_data=prev_cb),
+                types.InlineKeyboardButton(f"{page}/{max_page}", callback_data="noop"),
+                types.InlineKeyboardButton("⏭️", callback_data=next_cb)
+            )
+            markup.row(
+                types.InlineKeyboardButton("🔙 Quay Lại", callback_data="admin_panel")
+            )
+
+            bot.edit_message_text(
+                text_p,
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                parse_mode='Markdown',
+                reply_markup=markup
+            )
+            bot.answer_callback_query(call.id)
+
         # ADMIN - USERS
         elif data == "admin_users":
             if not db.is_admin(user_id):
@@ -3879,6 +4751,70 @@ def process_check_ip(message):
         bot.reply_to(message, f"❌ Lỗi: {e}")
 
 # ==================== COMMAND HANDLERS (ADMIN) ====================
+@bot.message_handler(commands=['clearram'])
+def cmd_clear_ram(message):
+    user_id = message.from_user.id
+    if not db.is_admin(user_id):
+        bot.reply_to(message, "⛔ Bạn không phải admin!")
+        return
+
+    proc = psutil.Process(os.getpid())
+    before = proc.memory_info().rss
+
+    try:
+        gc.collect()
+    except Exception:
+        pass
+
+    trimmed = False
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        if hasattr(libc, "malloc_trim"):
+            libc.malloc_trim(0)
+            trimmed = True
+    except Exception:
+        trimmed = False
+
+    after = proc.memory_info().rss
+    diff = before - after
+
+    bot.reply_to(
+        message,
+        f"🧹 **CLEAR RAM**\n\n"
+        f"📌 RSS trước: `{before/1024/1024:.2f} MB`\n"
+        f"📌 RSS sau: `{after/1024/1024:.2f} MB`\n"
+        f"📉 Giảm: `{diff/1024/1024:.2f} MB`\n"
+        f"🧠 malloc_trim: `{trimmed}`",
+        parse_mode='Markdown'
+    )
+
+@bot.message_handler(commands=['unpin', 'huytreo'])
+def cmd_unpin(message):
+    user_id = message.from_user.id
+    if not db.is_admin(user_id):
+        bot.reply_to(message, "⛔ Bạn không phải admin!")
+        return
+
+    try:
+        parts = message.text.split(maxsplit=2)
+        if len(parts) < 3:
+            bot.reply_to(message, "❌ Format: /unpin user_id file_name")
+            return
+        target_id = int(parts[1])
+        file_name = sanitize_filename(parts[2])
+
+        # kiểm tra tồn tại record
+        info = db.get_user_file(target_id, file_name)
+        if not info:
+            bot.reply_to(message, "❌ File không tồn tại trong DB!")
+            return
+
+        db.clear_file_pin(target_id, file_name)
+        bot.reply_to(message, f"✅ Đã hủy treo `{file_name}` của user `{target_id}`", parse_mode='Markdown')
+    except Exception as e:
+        bot.reply_to(message, f"❌ Lỗi: {e}")
+
 @bot.message_handler(commands=['addcoin', 'removecoin', 'setcoin'])
 def cmd_manage_coins(message):
     user_id = message.from_user.id
@@ -4044,6 +4980,12 @@ def handle_document(message):
     
     # Kiểm tra suspicious
     check_suspicious(user)
+
+    # Anti-spam upload
+    ok_up, up_msg = spam_protector.check(user_id, "upload", SPAM_FILE_UPLOAD_LIMIT, SPAM_FILE_UPLOAD_WINDOW)
+    if not ok_up:
+        bot.reply_to(message, up_msg)
+        return
     
     # Kiểm tra giới hạn file
     file_limit = get_user_file_limit(user_id)
@@ -4061,7 +5003,7 @@ def handle_document(message):
         return
     
     doc = message.document
-    file_name = doc.file_name
+    file_name = sanitize_filename(doc.file_name)
     
     if not file_name:
         bot.reply_to(message, "❌ File không có tên!")
@@ -4107,6 +5049,18 @@ def handle_document(message):
         file_info = bot.get_file(doc.file_id)
         downloaded_file = bot.download_file(file_info.file_path)
         
+        # Quét virus/botnet cơ bản (heuristic)
+        if file_ext != '.zip':
+            ok_scan, scan_msg = file_scanner.scan_bytes(file_name, downloaded_file)
+            if not ok_scan:
+                bot.edit_message_text(
+                    f"❌ **BỊ CHẶN BỞI ANTI-VIRUS**\n\n{scan_msg}",
+                    message.chat.id,
+                    msg.message_id,
+                    parse_mode='Markdown'
+                )
+                return
+
         bot.edit_message_text(
             f"✅ Đã tải xong! Đang xử lý...",
             message.chat.id,
@@ -4166,6 +5120,17 @@ def handle_zip_file(downloaded_file, file_name, user_id, user_folder, message, s
         # Lưu file zip
         with open(zip_path, 'wb') as f:
             f.write(downloaded_file)
+        
+        # Quét virus/botnet & chống zip-bomb
+        ok_zip, zip_msg = file_scanner.scan_zip_safely(zip_path)
+        if not ok_zip:
+            bot.edit_message_text(
+                f"❌ **BỊ CHẶN BỞI ANTI-VIRUS**\n\n{zip_msg}",
+                message.chat.id,
+                status_msg.message_id,
+                parse_mode='Markdown'
+            )
+            return
         
         # Giải nén với kiểm tra an toàn
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
@@ -4259,6 +5224,25 @@ def handle_zip_file(downloaded_file, file_name, user_id, user_folder, message, s
             )
             return
         
+
+        # Quét lại file script chính sau khi giải nén (heuristic)
+        try:
+            main_path = os.path.join(temp_dir, main_script)
+            if os.path.exists(main_path):
+                with open(main_path, 'rb') as fp:
+                    main_data = fp.read(VIRUS_SCAN_MAX_BYTES)
+                ok_main, msg_main = file_scanner.scan_bytes(main_script, main_data)
+                if not ok_main:
+                    bot.edit_message_text(
+                        f"❌ **BỊ CHẶN BỞI ANTI-VIRUS**\n\n{msg_main}",
+                        message.chat.id,
+                        status_msg.message_id,
+                        parse_mode='Markdown'
+                    )
+                    return
+        except Exception:
+            pass
+
         # Di chuyển files vào thư mục user
         moved_files = []
         for item in extracted_files:
